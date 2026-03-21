@@ -260,8 +260,11 @@ Run flood risk prediction for a given location.
 
 ## Screenshots
 
-### Live Weather Dashboard
+### Live Weather Dashboard Without connected Flask
 ![Dashboard](screenshots/dashboard.png)
+
+### Live Weather Dashboard With connected Flask
+![Dashboard](screenshots/dashboard2.png)
 
 ### Flood Risk Prediction
 ![Prediction](screenshots/prediction.png)
