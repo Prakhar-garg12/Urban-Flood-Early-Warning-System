@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import numpy as np
 import joblib
@@ -6,8 +6,10 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from tensorflow.keras.models import load_model
+from map_generator import generate_flood_map
+import os
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static")
 CORS(app)
 
 print("Loading LSTM model...")
@@ -29,12 +31,13 @@ FEATURES = [
     "is_monsoon",
 ]
 
-SEQUENCE_LENGTH = 5  # ✅ 30 se 5 kiya
+SEQUENCE_LENGTH = 5
 
-# ── Last 5 days API se fetch karo ──
+
+# ── Fetch last 5 days from APIs ──────────────────────────────────────────────
 def fetch_last_5_days(lat, lon):
     end_date   = datetime.today()
-    start_date = end_date - timedelta(days=9)  # 9 days isliye ki rolling sum ke liye buffer chahiye
+    start_date = end_date - timedelta(days=9)
     end_str    = end_date.strftime("%Y-%m-%d")
     start_str  = start_date.strftime("%Y-%m-%d")
 
@@ -69,7 +72,7 @@ def fetch_last_5_days(lat, lon):
     df_r["time"] = pd.to_datetime(df_r["time"])
     df = df.merge(df_r, on="time", how="left")
 
-    # Hourly soil moisture → daily average
+    # Hourly soil → daily average
     s_res = requests.get(
         "https://archive-api.open-meteo.com/v1/archive",
         params={
@@ -90,7 +93,7 @@ def fetch_last_5_days(lat, lon):
     df_soil      = df_soil.drop(columns=["date"])
     df = df.merge(df_soil, on="time", how="left")
 
-    # ── Engineer features (training ke same) ──
+    # Engineer features
     df = df.sort_values("time").reset_index(drop=True)
     df["rainfall_3d"] = df["precipitation_sum"].rolling(3).sum()
     df["rainfall_7d"] = df["precipitation_sum"].rolling(7).sum()
@@ -101,12 +104,16 @@ def fetch_last_5_days(lat, lon):
     )).clip(30, 99)
 
     df = df.ffill().fillna(0)
-
-    # ✅ Sirf last 5 rows
     df = df.tail(SEQUENCE_LENGTH).reset_index(drop=True)
 
-    print(f"Sequence dates: {df['time'].dt.strftime('%d-%b-%Y').tolist()}")
+    print(f"Sequence: {df['time'].dt.strftime('%d-%b').tolist()}")
     return df
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return send_from_directory(".", "flood_warning_dashboard.html")
 
 
 @app.route("/predict", methods=["POST"])
@@ -114,28 +121,22 @@ def predict():
     try:
         data = request.get_json()
 
-        # ✅ User ka lat/lon lo — default Bhopal
         lat = float(data.get("user_lat", 23.2599))
         lon = float(data.get("user_lon", 77.4126))
 
         print(f"\nFetching last 5 days for ({lat}, {lon})...")
 
-        # ✅ API se last 5 days fetch karo automatically
         df = fetch_last_5_days(lat, lon)
 
-        # Array banao (5, 11)
         arr = df[FEATURES].values
 
-        # Pad if less than 5 rows
         if len(arr) < SEQUENCE_LENGTH:
             pad = np.zeros((SEQUENCE_LENGTH - len(arr), len(FEATURES)))
             arr = np.vstack([pad, arr])
 
-        # Scale + reshape → (1, 5, 11)
         arr_sc = scaler.transform(arr)
         X      = arr_sc.reshape(1, SEQUENCE_LENGTH, len(FEATURES))
 
-        # Predict
         probs = model.predict(X, verbose=0)[0]
         cls   = int(np.argmax(probs))
 
@@ -143,27 +144,48 @@ def predict():
         prob_keys = ["Low", "Medium", "High"]
         prob_dict = {prob_keys[i]: float(probs[i]) for i in range(len(probs))}
 
-        last = df.iloc[-1]
-        print(f"Prediction: {label_map[cls]} ({probs[cls]*100:.1f}%)")
+        risk_label = label_map[cls]
+        last       = df.iloc[-1]
+
+        print(f"Prediction: {risk_label} ({probs[cls]*100:.1f}%)")
+
+        # ── Live values for map + frontend ──
+        live_values = {
+            "precipitation_sum"     : round(float(last["precipitation_sum"]), 2),
+            "river_discharge"       : round(float(last["river_discharge"]), 3),
+            "rainfall_3d"           : round(float(last["rainfall_3d"]), 2),
+            "rainfall_7d"           : round(float(last["rainfall_7d"]), 2),
+            "humidity"              : round(float(last["humidity"]), 1),
+            "soil_moisture_0_to_7cm": round(float(last["soil_moisture_0_to_7cm"]), 4),
+            "is_monsoon"            : int(last["is_monsoon"]),
+        }
+
+        # ── Generate flood map ──
+        try:
+            os.makedirs("static", exist_ok=True)
+            generate_flood_map(
+                risk_label  = risk_label,
+                confidence  = float(probs[cls]),
+                live_values = live_values,
+                lat         = lat,
+                lon         = lon,
+                output_path = "static/flood_map.html"
+            )
+            map_url = "/static/flood_map.html"
+            print(f"Map generated: {map_url}")
+        except Exception as map_err:
+            print(f"Map generation failed: {map_err}")
+            map_url = None
 
         return jsonify({
             "success"       : True,
             "risk_class"    : cls,
-            "risk_label"    : label_map.get(cls, "Unknown"),
+            "risk_label"    : risk_label,
             "confidence"    : float(probs[cls]),
             "probabilities" : prob_dict,
-            # ✅ Sequence info — debug ke liye
             "sequence_used" : df["time"].dt.strftime("%d-%b-%Y").tolist(),
-            # ✅ Live values — frontend tiles ke liye
-            "live_values"   : {
-                "precipitation_sum"     : round(float(last["precipitation_sum"]), 2),
-                "river_discharge"       : round(float(last["river_discharge"]), 3),
-                "rainfall_3d"           : round(float(last["rainfall_3d"]), 2),
-                "rainfall_7d"           : round(float(last["rainfall_7d"]), 2),
-                "humidity"              : round(float(last["humidity"]), 1),
-                "soil_moisture_0_to_7cm": round(float(last["soil_moisture_0_to_7cm"]), 4),
-                "is_monsoon"            : int(last["is_monsoon"]),
-            }
+            "live_values"   : live_values,
+            "map_url"       : map_url,
         })
 
     except Exception as e:
@@ -172,12 +194,17 @@ def predict():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory("static", filename)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status"  : "ok",
-        "features": FEATURES,
-        "sequence": SEQUENCE_LENGTH
+        "sequence": SEQUENCE_LENGTH,
+        "features": len(FEATURES),
     })
 
 
